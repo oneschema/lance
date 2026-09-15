@@ -7005,10 +7005,10 @@ mod tests {
                 let has_added_files = |frag: &Fragment| {
                     assert_eq!(frag.files.len(), 2);
                     let data_files = &frag.files;
-                    // Updated columns should be only columns in new data files
-                    // -2 field ids are tombstoned.
-                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, -2]);
-                    assert_eq!(data_files[1].fields.as_ref(), &[2, 1]);
+                    // The merge rewrites only the changed columns and leaves
+                    // the join key in the existing file.
+                    assert_eq!(data_files[0].fields.as_ref(), &[0, -2, 2]);
+                    assert_eq!(data_files[1].fields.as_ref(), &[1]);
                 };
                 has_added_files(&fragments_after[1]);
                 has_added_files(&fragments_after[2]);
@@ -14362,8 +14362,9 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
-    // Regression test: after a partial-schema merge_insert invalidates a fragment,
-    // compaction should succeed and subsequent searches should return correct results.
+    // Regression test: after a partial-schema merge_insert invalidates a fragment
+    // in a non-join-key index, compaction should succeed and subsequent searches
+    // should return correct results.
     //
     // The compaction planner separates indexed and unindexed fragments into different
     // groups. After invalidating the middle fragment, the indexed fragments on either
@@ -14420,8 +14421,19 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             let reader = Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()));
             ds.append(reader, None).await.unwrap();
         }
+        // Keep the join-key index so the partial merge uses the in-place path.
         ds.create_index(
             &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        // Create a BTree index on value_a, which the partial merge rewrites.
+        ds.create_index(
+            &["value_a"],
             IndexType::BTree,
             None,
             &ScalarIndexParams::default(),
@@ -14432,13 +14444,13 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
         let ds = Arc::new(ds);
 
-        // Invalidate fragment 2 (the middle one)
+        // Invalidate fragment 2 (the middle one) in the value_a index.
         let frag2_start = 2 * rows_per_frag;
         let ds = partial_merge_insert(ds, frag2_start..frag2_start + rows_per_frag, 999.0).await;
 
         // Verify pre-compaction state
         let indices = ds.load_indices().await.unwrap();
-        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let idx = indices.iter().find(|i| i.name == "value_a_idx").unwrap();
         assert!(!idx.fragment_bitmap.as_ref().unwrap().contains(2));
 
         // Run compaction with a target that forces merging of the small fragments.
@@ -14453,7 +14465,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         // Fragment 2 (unindexed) may or may not be compacted on its own.
         // Either way, the old fragment IDs in the bitmap should be replaced.
         let indices = ds.load_indices().await.unwrap();
-        let idx = indices.iter().find(|i| i.name == "id_idx").unwrap();
+        let idx = indices.iter().find(|i| i.name == "value_a_idx").unwrap();
         let bitmap = idx.fragment_bitmap.as_ref().unwrap();
         for &old_id in &[0u32, 1, 3, 4] {
             assert!(
