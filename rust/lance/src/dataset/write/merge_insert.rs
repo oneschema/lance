@@ -8260,8 +8260,8 @@ mod tests {
         async fn test_merge_insert_subcols_in_place_reports_fields_modified() {
             let Fixtures { ds, new_data } = Box::pin(setup(false)).await;
 
-            // `value` is field id 1 in the dataset schema; `key` (the join key)
-            // is written too because the source carries it.
+            // `value` is field id 1 in the dataset schema; `key` is the join
+            // key and is not rewritten even though the source carries it.
             let value_field_id = ds.schema().field("value").unwrap().id as u32;
             let key_field_id = ds.schema().field("key").unwrap().id as u32;
             let other_field_id = ds.schema().field("other").unwrap().id as u32;
@@ -8291,7 +8291,7 @@ mod tests {
                     assert!(matches!(update_mode, Some(RewriteColumns)));
                     assert!(
                         fields_modified.contains(&value_field_id)
-                            && fields_modified.contains(&key_field_id),
+                            && !fields_modified.contains(&key_field_id),
                         "patched fields must be reported, got {fields_modified:?}"
                     );
                     assert!(
