@@ -1140,11 +1140,39 @@ impl MergeInsertJob {
         self.create_full_table_joined_stream(source).await
     }
 
+    fn drop_join_key_columns(
+        batches: Vec<RecordBatch>,
+        join_keys: &[String],
+    ) -> Result<Vec<RecordBatch>> {
+        if batches.is_empty() || join_keys.is_empty() {
+            return Ok(batches);
+        }
+
+        let schema = batches[0].schema();
+        let join_key_indices = join_keys
+            .iter()
+            .map(|key| schema.index_of(key))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let projection = (0..schema.fields().len())
+            .filter(|index| !join_key_indices.contains(index))
+            .collect::<Vec<_>>();
+
+        if projection.len() == 1 && schema.fields()[projection[0]].name() == ROW_ADDR {
+            return Ok(batches);
+        }
+
+        batches
+            .into_iter()
+            .map(|batch| batch.project(&projection).map_err(Error::from))
+            .collect()
+    }
+
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
+        join_keys: &[String],
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
@@ -1499,6 +1527,13 @@ impl MergeInsertJob {
                 new_fragments.lock().unwrap().extend(fragments);
                 Ok(reservation_size)
             }
+            let batches = if matches!(frag_id.first(), Some(ScalarValue::UInt64(Some(_)))) {
+                // Matched rows have equal key values by definition, so rewriting the key only inflates fields_modified and prunes the key's scalar index (#3862).
+                Self::drop_join_key_columns(batches, join_keys)?
+            } else {
+                batches
+            };
+
             // We shouldn't need much more memory beyond what is already in the batches.
             let mut memory_size = batches
                 .iter()
@@ -2247,6 +2282,7 @@ impl MergeInsertJob {
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
                 target_bases_info,
+                &self.params.on,
             )
             .await?;
 
@@ -6566,16 +6602,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Fragment 3 is fully removed.  We could keep it technically but today it is removed
-        // which is also fine.  Fragment 2 is partially and must be removed.
-        //
-        // TODO: We should not be modifying the id_index here.  A merge_insert should not need
-        // to rewrite the id field.  However, it seems we are doing that today.  This should be
-        // fixed in
-        check_indices(&dataset, &[0, 1], &[0, 1]).await;
+        // Fragment 3 is fully removed. Fragment 2 is partially updated, but the id index
+        // remains valid because the merge does not rewrite the join key.
+        check_indices(&dataset, &[0, 1, 2, 3], &[0, 1]).await;
 
-        // One more test but this time we touch all fragments which causes the index to be removed
-        // entirely.
+        // One more test, this time touching all fragments. The id index remains valid, while
+        // the value index is removed because the value column is rewritten everywhere.
         let dataset = test_dataset().await;
 
         // Vertical merge insert (full schema), one fragment is deleted and should be removed from
@@ -6598,7 +6630,97 @@ mod tests {
             .await
             .unwrap();
 
-        check_indices(&dataset, &[], &[]).await;
+        check_indices(&dataset, &[0, 1, 2, 3], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn test_partial_merge_insert_preserves_join_key_index_and_values() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .col("other_value", array::step::<UInt32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(20))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let merge = |dataset, value| async move {
+            let ids: Vec<u32> = (5..55).collect();
+            let source_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt32, false),
+                Field::new("value", DataType::UInt32, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                source_schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(ids)),
+                    Arc::new(UInt32Array::from(vec![value; 50])),
+                ],
+            )
+            .unwrap();
+            MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(batch)],
+                    source_schema,
+                )))
+                .await
+                .unwrap()
+                .0
+        };
+
+        let dataset_after_first = merge(Arc::new(dataset), 999).await;
+        let id_index = dataset_after_first
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column("id")
+                    .supports_exact_equality(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            id_index
+                .effective_fragment_bitmap(&dataset_after_first.fragment_bitmap)
+                .unwrap(),
+            RoaringBitmap::from_iter([0, 1, 2])
+        );
+
+        let first_scan = dataset_after_first.scan().try_into_batch().await.unwrap();
+        let first_ids = first_scan["id"].as_primitive::<UInt32Type>();
+        let first_values = first_scan["value"].as_primitive::<UInt32Type>();
+        let first_other_values = first_scan["other_value"].as_primitive::<UInt32Type>();
+        for row in 0..first_scan.num_rows() {
+            let id = first_ids.value(row);
+            let expected_value = if (5..55).contains(&id) { 999 } else { id };
+            assert_eq!(first_values.value(row), expected_value);
+            assert_eq!(first_other_values.value(row), id);
+        }
+
+        let dataset_after_second = merge(dataset_after_first, 888).await;
+        let second_scan = dataset_after_second.scan().try_into_batch().await.unwrap();
+        let second_ids = second_scan["id"].as_primitive::<UInt32Type>();
+        let second_values = second_scan["value"].as_primitive::<UInt32Type>();
+        let second_other_values = second_scan["other_value"].as_primitive::<UInt32Type>();
+        for row in 0..second_scan.num_rows() {
+            let id = second_ids.value(row);
+            let expected_value = if (5..55).contains(&id) { 888 } else { id };
+            assert_eq!(second_values.value(row), expected_value);
+            assert_eq!(second_other_values.value(row), id);
+        }
     }
 
     #[tokio::test]
