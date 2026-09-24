@@ -66,26 +66,28 @@ async fn init_writer_if_necessary(
     Ok(false)
 }
 
-/// v2_0 vs v2_1+ field-to-column index mapping
-///  - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
-///  - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
-fn compute_field_column_indices(
-    schema: &Schema,
-    full_field_ids_len: usize,
-    version: LanceFileVersion,
-) -> Vec<i32> {
+/// v2_0 vs v2_1+ field-to-column index mapping for the output data file.
+///  - v2_1+ records only fields that contribute a top-level column (leaf fields
+///    and packed structs), matching what every other v2_1+ writer emits. Non-leaf
+///    fields are omitted entirely rather than recorded with a `-1` column index,
+///    so a later merge that tombstones a child id cannot leave an orphaned parent
+///    id pointing at a column that no longer exists.
+///  - v2_0 includes structural headers as columns, so every field in pre-order
+///    traversal is recorded with a concrete index.
+///
+/// Returns `(fields, column_indices)` for `DataFile::fields` /
+/// `DataFile::column_indices`; the two vectors have the same length.
+fn compute_data_file_fields(schema: &Schema, version: LanceFileVersion) -> (Vec<i32>, Vec<i32>) {
     let is_structural = version >= LanceFileVersion::V2_1;
-    let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids_len);
-    let mut curr_col_idx: i32 = 0;
+    let mut fields: Vec<i32> = Vec::new();
+    let mut column_indices: Vec<i32> = Vec::new();
     for field in schema.fields_pre_order() {
         if field.is_packed_struct() || field.is_leaf() || !is_structural {
-            field_column_indices.push(curr_col_idx);
-            curr_col_idx += 1;
-        } else {
-            field_column_indices.push(-1);
+            fields.push(field.id);
+            column_indices.push(column_indices.len() as i32);
         }
     }
-    field_column_indices
+    (fields, column_indices)
 }
 
 /// Finalize the current output file and return it as a single [Fragment].
@@ -100,7 +102,6 @@ fn compute_field_column_indices(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_current_output_file(
     schema: &Schema,
-    full_field_ids: &[i32],
     current_writer: &mut Option<Box<dyn Writer>>,
     current_filename: &mut Option<String>,
     current_page_table: &[ColumnInfo],
@@ -136,13 +137,13 @@ async fn finalize_current_output_file(
 
     // Register the newly closed output file as a fragment data file
     let mut fragment = Fragment::new(0);
-    let field_column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
+    let (fields, column_indices) = compute_data_file_fields(schema, version);
     let mut data_file = DataFile::new_unstarted(
         current_filename.take().unwrap(),
         ConcreteFileVersion::from(version),
     );
-    data_file.fields = full_field_ids.to_vec().into();
-    data_file.column_indices = field_column_indices.into();
+    data_file.fields = fields.into();
+    data_file.column_indices = column_indices.into();
     fragment.files.push(data_file);
     fragment.physical_rows = Some(total_rows_in_current as usize);
     Ok(fragment)
@@ -193,7 +194,6 @@ pub async fn rewrite_files_binary_copy(
     // - Optionally carries forward stable row ids and persists them inline in fragment metadata
     // Merge small Lance files into larger ones by page-level binary copy.
     let schema = dataset.schema().clone();
-    let full_field_ids = schema.field_ids();
 
     // The previous checks have ensured that the file versions of all files are consistent.
     let version: LanceFileVersion = ConcreteFileVersion::from_data_file_numbers(
@@ -462,7 +462,6 @@ pub async fn rewrite_files_binary_copy(
             if total_rows_in_current >= max_rows_per_file {
                 let fragment_out = finalize_current_output_file(
                     &schema,
-                    &full_field_ids,
                     &mut current_writer,
                     &mut current_filename,
                     &current_page_table,
@@ -495,7 +494,6 @@ pub async fn rewrite_files_binary_copy(
         init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename).await?;
         let frag = finalize_current_output_file(
             &schema,
-            &full_field_ids,
             &mut current_writer,
             &mut current_filename,
             &current_page_table,
@@ -602,4 +600,32 @@ async fn flush_footer(
     );
     file_writer.finish().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    #[test]
+    fn test_data_file_fields_record_only_column_contributing_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new_list("tags", ArrowField::new("item", DataType::Int64, true), true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        // v2_1+: only fields that contribute a top-level column are recorded —
+        // the list's `item` leaf (id 2) is present but the `tags` parent (id 1)
+        // is omitted entirely rather than mapped to a -1 column index.
+        let (fields, column_indices) = compute_data_file_fields(&schema, LanceFileVersion::V2_1);
+        assert_eq!(fields, vec![0, 2]);
+        assert_eq!(column_indices, vec![0, 1]);
+
+        // v2_0: structural headers are stored as columns, so every field in
+        // pre-order traversal is recorded with a concrete index.
+        let (fields, column_indices) = compute_data_file_fields(&schema, LanceFileVersion::V2_0);
+        assert_eq!(fields, vec![0, 1, 2]);
+        assert_eq!(column_indices, vec![0, 1, 2]);
+    }
 }
