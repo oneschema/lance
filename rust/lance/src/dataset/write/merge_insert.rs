@@ -183,6 +183,31 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     .unwrap()
 }
 
+/// Whether a field id recorded in a superseded data file's `fields` list should
+/// be tombstoned after a merge rewrote `updated_fields`. A field is superseded
+/// when its own column was rewritten, or — for non-leaf entries — when every
+/// field in its subtree was rewritten. Files produced by binary-copy compaction
+/// record non-leaf field ids (e.g. a list's parent field) with a `-1` column
+/// index; leaving such an id in place while its children are tombstoned lets a
+/// later reader see the parent but not the leaves it requires.
+fn tombstone_field_id(
+    field_id: i32,
+    updated_fields: &HashSet<i32>,
+    schema: &lance_core::datatypes::Schema,
+) -> bool {
+    if updated_fields.contains(&field_id) {
+        return true;
+    }
+    let Some(field) = schema.field_by_id(field_id) else {
+        return false;
+    };
+    !field.children.is_empty()
+        && field
+            .children
+            .iter()
+            .all(|child| tombstone_field_id(child.id, updated_fields, schema))
+}
+
 /// Format key values for error messages via extracting "on" column values from the given RecordBatch.
 pub fn format_key_values_on_columns(
     batch: &RecordBatch,
@@ -1657,14 +1682,21 @@ impl MergeInsertJob {
         // Collect the updated fragments, and map the field ids. Tombstone old ones
         // as needed.
         for fragment in &mut updated_fragments {
-            let updated_fields = fragment.files.last().unwrap().fields.clone();
+            let updated_fields: HashSet<i32> = fragment
+                .files
+                .last()
+                .unwrap()
+                .fields
+                .iter()
+                .copied()
+                .collect();
             all_fields_updated.extend(updated_fields.iter().map(|&f| f as u32));
             for data_file in &mut fragment.files.iter_mut().rev().skip(1) {
                 let new_fields: Arc<[i32]> = data_file
                     .fields
                     .iter()
                     .map(|field| {
-                        if updated_fields.contains(field) {
+                        if tombstone_field_id(*field, &updated_fields, dataset.schema()) {
                             -2 // Tombstone
                         } else {
                             *field
@@ -12252,5 +12284,135 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"qux"
         );
+    }
+
+    /// Regression test for binary-copy compaction recording non-leaf field ids
+    /// (e.g. a list's parent field) in `DataFile::fields`. A merge that then
+    /// supersedes the list's leaf column would tombstone the leaf id while
+    /// leaving the parent id in place, so the file's field map claimed the
+    /// parent without the leaf the reader requires and the next read of the
+    /// column failed with "ran out at field 'item'".
+    #[tokio::test]
+    async fn test_merge_insert_after_binary_copy_compaction() {
+        use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
+        use arrow_array::types::Int64Type;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new_list("tags", Field::new("item", DataType::Int64, true), true),
+            // Not updated by the merge below, so the compacted file keeps
+            // contributing this column and is not replaced outright.
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let make_batch = |id: i32| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![id])),
+                    Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+                        Some(vec![Some(id as i64)]),
+                    ])),
+                    Arc::new(Int32Array::from(vec![id * 10])),
+                ],
+            )
+            .unwrap()
+        };
+
+        // One fragment per row so compaction coalesces them via binary copy.
+        let reader = RecordBatchIterator::new(vec![Ok(make_batch(0))], schema.clone());
+        let mut ds = Dataset::write(reader, "memory://merge_after_binary_copy", None)
+            .await
+            .unwrap();
+        for id in 1..3 {
+            let reader = RecordBatchIterator::new(vec![Ok(make_batch(id))], schema.clone());
+            ds.append(Box::new(reader), None).await.unwrap();
+        }
+        assert_eq!(ds.get_fragments().len(), 3);
+
+        compact_files(
+            &mut ds,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                compaction_mode: Some(CompactionMode::TryBinaryCopy),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An index on the join key makes the merge patch the fragment's
+        // columns in place instead of rewriting whole fragments.
+        ds.create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Arc::new(ds);
+
+        // Updating every row's `tags` in the compacted fragment appends a
+        // column patch and tombstones the superseded field ids in the
+        // compacted file.
+        let update_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new_list("tags", Field::new("item", DataType::Int64, true), true),
+        ]));
+        let update_batch = |ids: Vec<i32>, first_tag: i64| {
+            RecordBatch::try_new(
+                update_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids.clone())),
+                    Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+                        ids.iter()
+                            .enumerate()
+                            .map(|(i, _)| Some(vec![Some(first_tag + i as i64)]))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let mut builder = MergeInsertBuilder::try_new(ds.clone(), vec!["id".into()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let (ds, _) = builder
+            .try_build()
+            .unwrap()
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                vec![Ok(update_batch(vec![0, 1, 2], 10))],
+                update_schema.clone(),
+            ))))
+            .await
+            .unwrap();
+
+        // A partial second merge must read `tags` through the compacted
+        // file's field map; before the fix this failed because the map kept
+        // the list's parent id after its leaf id was tombstoned.
+        let mut builder = MergeInsertBuilder::try_new(ds.clone(), vec!["id".into()]).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let (ds, _) = builder
+            .try_build()
+            .unwrap()
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                vec![Ok(update_batch(vec![0, 1], 20))],
+                update_schema.clone(),
+            ))))
+            .await
+            .unwrap();
+
+        let batch = ds.scan().try_into_batch().await.unwrap();
+        let mut tags: Vec<i64> = Vec::new();
+        for row in batch["tags"].as_list::<i32>().iter() {
+            let values = row.unwrap();
+            tags.push(values.as_primitive::<Int64Type>().value(0));
+        }
+        assert_eq!(tags, vec![20, 21, 12]);
     }
 }
